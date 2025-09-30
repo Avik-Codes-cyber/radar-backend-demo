@@ -38,7 +38,7 @@ func main() {
 }
 
 // processFile determines the file type and routes to the appropriate parser
-func processFile(cfg *config.Config, inputPath, outputPath string) error {
+func processFile(_ *config.Config, inputPath, outputPath string) error {
 	// Get file extension
 	ext := strings.ToLower(filepath.Ext(inputPath))
 
@@ -67,12 +67,4 @@ func processFile(cfg *config.Config, inputPath, outputPath string) error {
 	default:
 		return fmt.Errorf("unsupported file format: %s (supported: .log, .cef, .csv, .parquet)", ext)
 	}
-}
-
-// getEnv retrieves environment variable or returns default value
-func getEnv(key, defaultValue string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
-	}
-	return defaultValue
 }

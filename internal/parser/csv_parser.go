@@ -10,13 +10,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
+	"regexp"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
 	_ "github.com/marcboeker/go-duckdb"
-	"github.com/xitongsys/parquet-go-source/local"
-	"github.com/xitongsys/parquet-go/reader"
 	"superalign.ai/config"
 	"superalign.ai/internal/kafka"
 	"superalign.ai/models"
@@ -27,8 +28,9 @@ type CSVParser struct {
 }
 
 type csvParseJob struct {
-	rowNum int
-	row    []string
+	rowNum    int
+	row       []string
+	headerMap map[string]int
 }
 
 func NewCSVParser() *CSVParser {
@@ -145,22 +147,25 @@ func (p *CSVParser) ParseCSVToKafka(inputPath, dlqPath string, useParquet bool) 
 	rawRows := make(chan csvParseJob, bufferSize)
 	entries := make(chan *models.CSVLogEntry, bufferSize)
 
-	var wg sync.WaitGroup
+	// Separate wait groups for parsers and publishers to avoid deadlock
+	var parserWg sync.WaitGroup
+	var publisherWg sync.WaitGroup
 	errChan := make(chan error, numWorkers+numPublishers+1)
 
 	// Stage 1: Reader - either CSV or Parquet
-	wg.Add(1)
+	parserWg.Add(1)
 	if useParquet {
-		go p.parquetReaderBatched(ctx, &wg, cfg, inputPath, rawRows, errChan)
+		// Use DuckDB for dynamic Parquet reading instead of xitongsys
+		go p.duckDBParquetReader(ctx, &parserWg, inputPath, rawRows, errChan)
 	} else {
-		go p.csvReader(ctx, &wg, inputPath, rawRows, errChan)
+		go p.csvReader(ctx, &parserWg, inputPath, rawRows, errChan)
 	}
 
 	// Stage 2: Parser workers
 	for i := 0; i < numWorkers; i++ {
-		wg.Add(1)
+		parserWg.Add(1)
 		go func(workerID int) {
-			defer wg.Done()
+			defer parserWg.Done()
 
 			for job := range rawRows {
 				select {
@@ -176,119 +181,7 @@ func (p *CSVParser) ParseCSVToKafka(inputPath, dlqPath string, useParquet bool) 
 					continue
 				}
 
-				entry := &models.CSVLogEntry{}
-				// Map row to struct fields (assuming order matches headers)
-				if len(job.row) >= 111 {
-					entry.Timestamp = job.row[0]
-					entry.Source = job.row[1]
-					entry.Message = job.row[2]
-					entry.Header1DeviceVendor = job.row[3]
-					entry.Header2DeviceProduct = job.row[4]
-					entry.Header4DeviceEventClassId = job.row[5]
-					entry.Header5Name = job.row[6]
-					entry.Duser = job.row[7]
-					entry.Cn1 = job.row[8]
-					entry.Dpt = job.row[9]
-					entry.Dst = job.row[10]
-					entry.Out = job.row[11]
-					entry.Act = job.row[12]
-					entry.EventId = job.row[13]
-					entry.Type = job.row[14]
-					entry.Start = job.row[15]
-					entry.End = job.row[16]
-					entry.App = job.row[17]
-					entry.Proto = job.row[18]
-					entry.Art = job.row[19]
-					entry.Cat = job.row[20]
-					entry.DeviceSeverity = job.row[21]
-					entry.Rt = job.row[22]
-					entry.Src = job.row[23]
-					entry.SourceZoneURI = job.row[24]
-					entry.Spt = job.row[25]
-					entry.Dhost = job.row[26]
-					entry.DestinationZoneURI = job.row[27]
-					entry.Request = job.row[28]
-					entry.RequestContext = job.row[29]
-					entry.RequestMethod = job.row[30]
-					entry.Ahost = job.row[31]
-					entry.Agt = job.row[32]
-					entry.DeviceExternalId = job.row[33]
-					entry.DeviceInboundInterface = job.row[34]
-					entry.DeviceOutboundInterface = job.row[35]
-					entry.Suser = job.row[36]
-					entry.Shost = job.row[37]
-					entry.Reason = job.row[38]
-					entry.RequestClientApplication = job.row[39]
-					entry.Cnt = job.row[40]
-					entry.Amac = job.row[41]
-					entry.Atz = job.row[42]
-					entry.Dvchost = job.row[43]
-					entry.Dtz = job.row[44]
-					entry.Dvc = job.row[45]
-					entry.DeviceZoneURI = job.row[46]
-					entry.DeviceFacility = job.row[47]
-					entry.ExternalId = job.row[48]
-					entry.Msg = job.row[49]
-					entry.At = job.row[50]
-					entry.CategorySignificance = job.row[51]
-					entry.CategoryBehavior = job.row[52]
-					entry.CategoryDeviceGroup = job.row[53]
-					entry.Catdt = job.row[54]
-					entry.CategoryOutcome = job.row[55]
-					entry.CategoryObject = job.row[56]
-					entry.Cs1 = job.row[57]
-					entry.Cs2 = job.row[58]
-					entry.Cs3 = job.row[59]
-					entry.Cs4 = job.row[60]
-					entry.Cs5 = job.row[61]
-					entry.Cs6 = job.row[62]
-					entry.Cs1Label = job.row[63]
-					entry.Cs2Label = job.row[64]
-					entry.Cs3Label = job.row[65]
-					entry.Cs4Label = job.row[66]
-					entry.Cs5Label = job.row[67]
-					entry.Cs6Label = job.row[68]
-					entry.Cn1Label = job.row[69]
-					entry.Cn2 = job.row[70]
-					entry.Cn2Label = job.row[71]
-					entry.Cn3 = job.row[72]
-					entry.Cn3Label = job.row[73]
-					entry.Cn4 = job.row[74]
-					entry.Cn4Label = job.row[75]
-					entry.Cn5 = job.row[76]
-					entry.Cn5Label = job.row[77]
-					entry.Cn6 = job.row[78]
-					entry.Cn6Label = job.row[79]
-					entry.C6a2Label = job.row[80]
-					entry.C6a3Label = job.row[81]
-					entry.C6a2 = job.row[82]
-					entry.C6a3 = job.row[83]
-					entry.DeviceProcessName = job.row[84]
-					entry.Duid = job.row[85]
-					entry.Suid = job.row[86]
-					entry.Spid = job.row[87]
-					entry.Dproc = job.row[88]
-					entry.Sproc = job.row[89]
-					entry.Outcome = job.row[90]
-					entry.DestinationServiceName = job.row[91]
-					entry.Dpriv = job.row[92]
-					entry.OldFileId = job.row[93]
-					entry.OldFileHash = job.row[94]
-					entry.Fname = job.row[95]
-					entry.FileId = job.row[96]
-					entry.FileType = job.row[97]
-					entry.SourceTranslatedAddress = job.row[98]
-					entry.SourceTranslatedPort = job.row[99]
-					entry.In = job.row[100]
-					entry.Smac = job.row[101]
-					entry.Dmac = job.row[102]
-					entry.DeviceDirection = job.row[103]
-					entry.Dntdom = job.row[104]
-					entry.DeviceTranslatedAddress = job.row[105]
-					entry.DstName = job.row[106]
-					entry.DestinationName = job.row[107]
-					entry.URL = job.row[108]
-				}
+				entry := p.mapRowToEntry(job.row, job.headerMap)
 
 				select {
 				case entries <- entry:
@@ -302,25 +195,28 @@ func (p *CSVParser) ParseCSVToKafka(inputPath, dlqPath string, useParquet bool) 
 	// Stage 3: Publisher workers (scaled based on config)
 	fmt.Printf("Starting pipeline: %d parser workers, %d publisher workers\n", numWorkers, numPublishers)
 	for i := 0; i < numPublishers; i++ {
-		wg.Add(1)
-		go p.publishWorker(ctx, &wg, producer, cfg, entries, dlqWriter, &dlqMutex)
+		publisherWg.Add(1)
+		go p.publishWorker(ctx, &publisherWg, producer, cfg, entries, dlqWriter, &dlqMutex)
 	}
 
-	// Close entries after all parsers finish
+	// Close entries channel after all parsers finish
 	go func() {
-		wg.Wait()
+		parserWg.Wait()
+		fmt.Println("All parsers completed, closing entries channel...")
 		close(entries)
 	}()
 
-	// Wait with timeout
+	// Wait for parsers and publishers with timeout
 	done := make(chan struct{})
 	go func() {
-		wg.Wait()
+		parserWg.Wait()
+		publisherWg.Wait()
 		close(done)
 	}()
 
 	select {
 	case <-done:
+		fmt.Println("All workers completed successfully")
 	case err := <-errChan:
 		cancel()
 		<-done
@@ -333,6 +229,102 @@ func (p *CSVParser) ParseCSVToKafka(inputPath, dlqPath string, useParquet bool) 
 
 	p.metrics.Report()
 	return nil
+}
+
+// duckDBParquetReader reads Parquet files dynamically using DuckDB
+func (p *CSVParser) duckDBParquetReader(ctx context.Context, wg *sync.WaitGroup, inputPath string, rawRows chan csvParseJob, errChan chan error) {
+	defer wg.Done()
+	defer close(rawRows)
+
+	absPath, err := filepath.Abs(inputPath)
+	if err != nil {
+		select {
+		case errChan <- fmt.Errorf("failed to get absolute path: %w", err):
+		default:
+		}
+		return
+	}
+
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		select {
+		case errChan <- fmt.Errorf("failed to open DuckDB: %w", err):
+		default:
+		}
+		return
+	}
+	defer db.Close()
+
+	// Query all rows from Parquet
+	query := fmt.Sprintf("SELECT * FROM read_parquet('%s')", absPath)
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		select {
+		case errChan <- fmt.Errorf("failed to query Parquet: %w", err):
+		default:
+		}
+		return
+	}
+	defer rows.Close()
+
+	// Get column names (headers)
+	columns, err := rows.Columns()
+	if err != nil {
+		select {
+		case errChan <- fmt.Errorf("failed to get columns: %w", err):
+		default:
+		}
+		return
+	}
+
+	// Validate and build header map
+	fmt.Printf("Reading Parquet with DuckDB: %d columns, dynamic schema\n", len(columns))
+	validateHeaderMapping(columns, reflect.TypeOf(models.CSVLogEntry{}))
+
+	headerMap := buildHeaderMapFromRow(columns)
+
+	// Prepare value holders
+	values := make([]interface{}, len(columns))
+	valuePtrs := make([]interface{}, len(columns))
+	for i := range values {
+		valuePtrs[i] = &values[i]
+	}
+
+	rowNum := 0
+	for rows.Next() {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		if err := rows.Scan(valuePtrs...); err != nil {
+			continue
+		}
+
+		rowNum++
+		row := make([]string, len(columns))
+		for i, val := range values {
+			if val != nil {
+				row[i] = fmt.Sprintf("%v", val)
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case rawRows <- csvParseJob{rowNum: rowNum, row: row, headerMap: headerMap}:
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		select {
+		case errChan <- fmt.Errorf("row iteration error: %w", err):
+		default:
+		}
+	}
+
+	fmt.Printf("DuckDB Parquet reader completed: %d rows read\n", rowNum)
 }
 
 func (p *CSVParser) csvReader(ctx context.Context, wg *sync.WaitGroup, inputPath string, rawRows chan csvParseJob, errChan chan error) {
@@ -354,14 +346,20 @@ func (p *CSVParser) csvReader(ctx context.Context, wg *sync.WaitGroup, inputPath
 	csvReader.TrimLeadingSpace = true
 	csvReader.ReuseRecord = false // Don't reuse for concurrent processing
 
-	// Skip header
-	if _, err := csvReader.Read(); err != nil {
+	// Read header and build header map (case-insensitive)
+	headerRow, err := csvReader.Read()
+	if err != nil {
 		select {
 		case errChan <- fmt.Errorf("failed to read header: %w", err):
 		default:
 		}
 		return
 	}
+
+	// Validate header mapping (one-time debug output)
+	validateHeaderMapping(headerRow, reflect.TypeOf(models.CSVLogEntry{}))
+
+	headerMap := buildHeaderMapFromRow(headerRow)
 
 	rowNum := 0
 	for {
@@ -377,75 +375,12 @@ func (p *CSVParser) csvReader(ctx context.Context, wg *sync.WaitGroup, inputPath
 		select {
 		case <-ctx.Done():
 			return
-		case rawRows <- csvParseJob{rowNum: rowNum, row: append([]string(nil), row...)}:
+		case rawRows <- csvParseJob{rowNum: rowNum, row: append([]string(nil), row...), headerMap: headerMap}:
 		}
 	}
 }
 
 // parquetReaderBatched reads Parquet files in batches for better performance
-func (p *CSVParser) parquetReaderBatched(ctx context.Context, wg *sync.WaitGroup, cfg *config.Config, inputPath string, rawRows chan csvParseJob, errChan chan error) {
-	defer wg.Done()
-	defer close(rawRows)
-
-	fr, err := local.NewLocalFileReader(inputPath)
-	if err != nil {
-		select {
-		case errChan <- fmt.Errorf("failed to open parquet: %w", err):
-		default:
-		}
-		return
-	}
-	defer fr.Close()
-
-	pr, err := reader.NewParquetReader(fr, new(models.CSVLogEntry), 4)
-	if err != nil {
-		select {
-		case errChan <- fmt.Errorf("failed to create parquet reader: %w", err):
-		default:
-		}
-		return
-	}
-	defer pr.ReadStop()
-
-	totalRows := int(pr.GetNumRows())
-	batchSize := cfg.ParquetBatchSize
-	fmt.Printf("Reading %d rows from Parquet in batches of %d\n", totalRows, batchSize)
-
-	rowNum := 0
-	for i := 0; i < totalRows; i += batchSize {
-		// Calculate actual batch size (may be smaller at the end)
-		currentBatchSize := batchSize
-		if i+batchSize > totalRows {
-			currentBatchSize = totalRows - i
-		}
-
-		// Read batch
-		entries := make([]models.CSVLogEntry, currentBatchSize)
-		if err := pr.Read(&entries); err != nil {
-			p.metrics.linesFailed.Add(uint64(currentBatchSize))
-			continue
-		}
-
-		// Send batch to workers
-		for j := 0; j < currentBatchSize; j++ {
-			rowNum++
-			row := p.entryToRow(&entries[j])
-
-			select {
-			case <-ctx.Done():
-				return
-			case rawRows <- csvParseJob{rowNum: rowNum, row: row}:
-			default:
-				// Channel full - apply backpressure
-				select {
-				case <-ctx.Done():
-					return
-				case rawRows <- csvParseJob{rowNum: rowNum, row: row}:
-				}
-			}
-		}
-	}
-}
 
 func (p *CSVParser) publishWorker(ctx context.Context, wg *sync.WaitGroup, producer *kafka.Producer,
 	cfg *config.Config, entries chan *models.CSVLogEntry, dlqWriter *bufio.Writer, dlqMutex *sync.Mutex) {
@@ -478,16 +413,20 @@ func (p *CSVParser) publishWorker(ctx context.Context, wg *sync.WaitGroup, produ
 
 			if pubErr == nil {
 				p.metrics.messagesPublished.Add(uint64(batchSize))
+				totalPublished := p.metrics.messagesPublished.Load()
+				fmt.Printf("Published batch of %d messages to Kafka topic '%s' (total: %d)\n", batchSize, cfg.KafkaTopic, totalPublished)
 				batch = batch[:0]
 				return
 			}
 
+			fmt.Printf("Kafka publish attempt %d failed: %v\n", attempt+1, pubErr)
 			if attempt < maxRetries-1 {
 				time.Sleep(retryBackoff * time.Duration(attempt+1))
 			}
 		}
 
 		// All retries failed - write to DLQ
+		fmt.Printf("Batch of %d messages failed after %d retries, writing to DLQ\n", batchSize, maxRetries)
 		p.metrics.messagesFailed.Add(uint64(batchSize))
 		dlqMutex.Lock()
 		for _, b := range batch {
@@ -503,6 +442,7 @@ func (p *CSVParser) publishWorker(ctx context.Context, wg *sync.WaitGroup, produ
 		case e, ok := <-entries:
 			if !ok {
 				flush()
+				fmt.Println("Publisher worker finished")
 				return
 			}
 
@@ -527,30 +467,110 @@ func (p *CSVParser) publishWorker(ctx context.Context, wg *sync.WaitGroup, produ
 	}
 }
 
-func (p *CSVParser) entryToRow(entry *models.CSVLogEntry) []string {
-	return []string{
-		entry.Timestamp, entry.Source, entry.Message, entry.Header1DeviceVendor,
-		entry.Header2DeviceProduct, entry.Header4DeviceEventClassId, entry.Header5Name,
-		entry.Duser, entry.Cn1, entry.Dpt, entry.Dst, entry.Out, entry.Act, entry.EventId,
-		entry.Type, entry.Start, entry.End, entry.App, entry.Proto, entry.Art, entry.Cat,
-		entry.DeviceSeverity, entry.Rt, entry.Src, entry.SourceZoneURI, entry.Spt,
-		entry.Dhost, entry.DestinationZoneURI, entry.Request, entry.RequestContext,
-		entry.RequestMethod, entry.Ahost, entry.Agt, entry.DeviceExternalId,
-		entry.DeviceInboundInterface, entry.DeviceOutboundInterface, entry.Suser,
-		entry.Shost, entry.Reason, entry.RequestClientApplication, entry.Cnt, entry.Amac,
-		entry.Atz, entry.Dvchost, entry.Dtz, entry.Dvc, entry.DeviceZoneURI,
-		entry.DeviceFacility, entry.ExternalId, entry.Msg, entry.At,
-		entry.CategorySignificance, entry.CategoryBehavior, entry.CategoryDeviceGroup,
-		entry.Catdt, entry.CategoryOutcome, entry.CategoryObject, entry.Cs1, entry.Cs2,
-		entry.Cs3, entry.Cs4, entry.Cs5, entry.Cs6, entry.Cs1Label, entry.Cs2Label,
-		entry.Cs3Label, entry.Cs4Label, entry.Cs5Label, entry.Cs6Label, entry.Cn1Label,
-		entry.Cn2, entry.Cn2Label, entry.Cn3, entry.Cn3Label, entry.Cn4, entry.Cn4Label,
-		entry.Cn5, entry.Cn5Label, entry.Cn6, entry.Cn6Label, entry.C6a2Label,
-		entry.C6a3Label, entry.C6a2, entry.C6a3, entry.DeviceProcessName, entry.Duid,
-		entry.Suid, entry.Spid, entry.Dproc, entry.Sproc, entry.Outcome,
-		entry.DestinationServiceName, entry.Dpriv, entry.OldFileId, entry.OldFileHash,
-		entry.Fname, entry.FileId, entry.FileType, entry.SourceTranslatedAddress,
-		entry.SourceTranslatedPort, entry.In, entry.Smac, entry.Dmac, entry.DeviceDirection,
-		entry.Dntdom, entry.DeviceTranslatedAddress, entry.DstName, entry.DestinationName, entry.URL,
+// normalizeHeader converts a string to lowercase and removes all non-alphanumeric characters
+func normalizeHeader(s string) string {
+	s = strings.ToLower(s)   // lowercase
+	s = strings.TrimSpace(s) // trim leading/trailing spaces
+	// remove all non-alphanumeric characters
+	re := regexp.MustCompile(`[^a-z0-9]`)
+	s = re.ReplaceAllString(s, "")
+	return s
+}
+
+// buildHeaderMapFromRow builds a normalized header map from CSV/Parquet header row
+func buildHeaderMapFromRow(headerRow []string) map[string]int {
+	headerMap := make(map[string]int, len(headerRow))
+	for idx, h := range headerRow {
+		normalized := normalizeHeader(h)
+		headerMap[normalized] = idx
+		// Debug: show header normalization
+		if h != normalized {
+			fmt.Printf("Header mapping: '%s' → '%s' (index %d)\n", h, normalized, idx)
+		}
 	}
+	return headerMap
+}
+
+// mapRowToEntry maps a CSV/Parquet row to a CSVLogEntry struct
+func (p *CSVParser) mapRowToEntry(row []string, headerMap map[string]int) *models.CSVLogEntry {
+	entry := &models.CSVLogEntry{}
+
+	if len(headerMap) == 0 || len(row) == 0 {
+		return entry
+	}
+
+	v := reflect.ValueOf(entry).Elem() // struct value
+	t := v.Type()                      // struct type
+
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		fieldName := normalizeHeader(field.Name) // normalize struct field
+
+		if idx, ok := headerMap[fieldName]; ok && idx < len(row) {
+			fieldValue := row[idx]
+			if fieldValue != "" {
+				v.Field(i).SetString(fieldValue)
+			}
+		}
+	}
+
+	return entry
+}
+
+// validateHeaderMapping shows which CSV headers map to struct fields and which are unmapped
+func validateHeaderMapping(csvHeaders []string, structType reflect.Type) {
+	fmt.Println("\n=== Header Mapping Validation ===")
+
+	// Build struct field map
+	structFields := make(map[string]string) // normalized -> original field name
+	for i := 0; i < structType.NumField(); i++ {
+		field := structType.Field(i)
+		normalized := normalizeHeader(field.Name)
+		structFields[normalized] = field.Name
+	}
+
+	// Check CSV headers
+	mapped := 0
+	unmapped := []string{}
+
+	for _, csvHeader := range csvHeaders {
+		normalized := normalizeHeader(csvHeader)
+		if fieldName, ok := structFields[normalized]; ok {
+			mapped++
+			fmt.Printf("✓ CSV '%s' → Struct '%s'\n", csvHeader, fieldName)
+		} else {
+			unmapped = append(unmapped, csvHeader)
+		}
+	}
+
+	fmt.Printf("\nSummary: %d/%d headers mapped\n", mapped, len(csvHeaders))
+
+	if len(unmapped) > 0 {
+		fmt.Printf("\n⚠ Unmapped CSV headers (%d):\n", len(unmapped))
+		for _, h := range unmapped {
+			fmt.Printf("  - '%s' (normalized: '%s')\n", h, normalizeHeader(h))
+		}
+	}
+
+	// Check for struct fields without CSV headers
+	csvHeadersMap := make(map[string]bool)
+	for _, h := range csvHeaders {
+		csvHeadersMap[normalizeHeader(h)] = true
+	}
+
+	missingInCSV := []string{}
+	for normalized, fieldName := range structFields {
+		if !csvHeadersMap[normalized] {
+			missingInCSV = append(missingInCSV, fieldName)
+		}
+	}
+
+	if len(missingInCSV) > 0 {
+		fmt.Printf("\n⚠ Struct fields without CSV headers (%d):\n", len(missingInCSV))
+		for _, f := range missingInCSV {
+			fmt.Printf("  - %s (normalized: '%s')\n", f, normalizeHeader(f))
+		}
+	}
+
+	fmt.Println("=== End Validation ===")
 }
