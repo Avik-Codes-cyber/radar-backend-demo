@@ -113,9 +113,7 @@ class ClickHouseWriter:
                 raise
 
 
-# ============================================================================
-# Tools Metadata Loader (for broadcast state)
-# ============================================================================
+
 def load_supabase_tools() -> Dict[str, Dict[str, Any]]:
     """Load tools metadata from Supabase"""
     url = os.getenv("SUPABASE_URL", "")
@@ -143,9 +141,7 @@ def load_supabase_tools() -> Dict[str, Dict[str, Any]]:
         return {}
 
 
-# ============================================================================
 # Flink Functions
-# ============================================================================
 class ParseJsonMap(MapFunction):
     """Parse JSON strings to dictionaries"""
     
@@ -234,9 +230,7 @@ class WindowBatchWriter(ProcessWindowFunction):
             self.writer.client.close()
 
 
-# ============================================================================
 # Main Pipeline
-# ============================================================================
 def main():
     # Configuration
     topic = os.getenv("KAFKA_TOPIC", "tools-events")
@@ -253,9 +247,7 @@ def main():
     
     print(f"⚙ Starting pipeline with parallelism={parallelism}, window={window_seconds}s")
     
-    # ========================================================================
-    # Step 1: Kafka Source
-    # ========================================================================
+   # Setting up Kafka Source
     source = KafkaSource.builder() \
         .set_bootstrap_servers(bootstrap) \
         .set_topics(topic) \
@@ -270,17 +262,17 @@ def main():
         source_name="kafka-tools-source"
     )
     
-    # ========================================================================
-    # Step 2: Parse JSON
-    # ========================================================================
+    # Parsing JSON
     parsed_stream = kafka_stream.map(
         ParseJsonMap(),
         output_type=Types.PICKLED_BYTE_ARRAY()
     )
     
+    # Loading tools metadata
     tools_lookup = load_supabase_tools()
     
    
+    # Creating broadcast descriptor
     tools_broadcast_descriptor = MapStateDescriptor(
         "tools-metadata",
         Types.STRING(),
@@ -288,21 +280,24 @@ def main():
     )
     
     
+    # Creating broadcast stream
     tools_stream = env.from_collection([tools_lookup])
     tools_broadcast = tools_stream.broadcast(tools_broadcast_descriptor)
     
     
+    # Enriching stream with tools metadata
     enriched_stream = parsed_stream.connect(tools_broadcast).process(
         EnrichWithToolMetadata(),
         output_type=Types.PICKLED_BYTE_ARRAY()
     )
     
     
+    # Windowing and batching
     result = enriched_stream \
         .window_all(TumblingProcessingTimeWindows.of(Time.seconds(window_seconds))) \
         .process(WindowBatchWriter(), output_type=Types.LONG())
     
-    # Optional: Print batch statistics
+    # Printing batch statistics
     result.print()
     
    
