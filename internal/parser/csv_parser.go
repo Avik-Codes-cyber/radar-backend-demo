@@ -123,21 +123,35 @@ func (p *CSVParser) ParseCSVToKafka(inputPath, dlqPath string, useParquet bool) 
 		}
 	}
 
-	numWorkers := runtime.NumCPU()
-	if numWorkers < 2 {
-		numWorkers = 2
+	// Determine optimal worker counts from config
+	numWorkers := cfg.ParserWorkers
+	if numWorkers == 0 {
+		numWorkers = runtime.NumCPU()
+		if numWorkers < 2 {
+			numWorkers = 2
+		}
 	}
 
-	rawRows := make(chan csvParseJob, numWorkers*100)
-	entries := make(chan *models.CSVLogEntry, 4096)
+	numPublishers := cfg.PublisherWorkers
+	if numPublishers == 0 {
+		numPublishers = runtime.NumCPU() / 2
+		if numPublishers < 3 {
+			numPublishers = 3
+		}
+	}
+
+	// Use configurable buffer sizes for backpressure
+	bufferSize := cfg.ChannelBufferSize
+	rawRows := make(chan csvParseJob, bufferSize)
+	entries := make(chan *models.CSVLogEntry, bufferSize)
 
 	var wg sync.WaitGroup
-	errChan := make(chan error, numWorkers+3)
+	errChan := make(chan error, numWorkers+numPublishers+1)
 
 	// Stage 1: Reader - either CSV or Parquet
 	wg.Add(1)
 	if useParquet {
-		go p.parquetReader(ctx, &wg, inputPath, rawRows, errChan)
+		go p.parquetReaderBatched(ctx, &wg, cfg, inputPath, rawRows, errChan)
 	} else {
 		go p.csvReader(ctx, &wg, inputPath, rawRows, errChan)
 	}
@@ -285,8 +299,8 @@ func (p *CSVParser) ParseCSVToKafka(inputPath, dlqPath string, useParquet bool) 
 		}(i)
 	}
 
-	// Stage 3: Publisher workers
-	numPublishers := 3
+	// Stage 3: Publisher workers (scaled based on config)
+	fmt.Printf("Starting pipeline: %d parser workers, %d publisher workers\n", numWorkers, numPublishers)
 	for i := 0; i < numPublishers; i++ {
 		wg.Add(1)
 		go p.publishWorker(ctx, &wg, producer, cfg, entries, dlqWriter, &dlqMutex)
@@ -311,10 +325,10 @@ func (p *CSVParser) ParseCSVToKafka(inputPath, dlqPath string, useParquet bool) 
 		cancel()
 		<-done
 		return err
-	case <-time.After(30 * time.Minute):
+	case <-time.After(time.Duration(cfg.ProcessingTimeoutMin) * time.Minute):
 		cancel()
 		<-done
-		return fmt.Errorf("parsing timeout after 30 minutes")
+		return fmt.Errorf("parsing timeout after %d minutes", cfg.ProcessingTimeoutMin)
 	}
 
 	p.metrics.Report()
@@ -368,7 +382,8 @@ func (p *CSVParser) csvReader(ctx context.Context, wg *sync.WaitGroup, inputPath
 	}
 }
 
-func (p *CSVParser) parquetReader(ctx context.Context, wg *sync.WaitGroup, inputPath string, rawRows chan csvParseJob, errChan chan error) {
+// parquetReaderBatched reads Parquet files in batches for better performance
+func (p *CSVParser) parquetReaderBatched(ctx context.Context, wg *sync.WaitGroup, cfg *config.Config, inputPath string, rawRows chan csvParseJob, errChan chan error) {
 	defer wg.Done()
 	defer close(rawRows)
 
@@ -392,23 +407,42 @@ func (p *CSVParser) parquetReader(ctx context.Context, wg *sync.WaitGroup, input
 	}
 	defer pr.ReadStop()
 
-	rowNum := 0
-	num := int(pr.GetNumRows())
+	totalRows := int(pr.GetNumRows())
+	batchSize := cfg.ParquetBatchSize
+	fmt.Printf("Reading %d rows from Parquet in batches of %d\n", totalRows, batchSize)
 
-	for i := 0; i < num; i++ {
-		entries := make([]models.CSVLogEntry, 1)
+	rowNum := 0
+	for i := 0; i < totalRows; i += batchSize {
+		// Calculate actual batch size (may be smaller at the end)
+		currentBatchSize := batchSize
+		if i+batchSize > totalRows {
+			currentBatchSize = totalRows - i
+		}
+
+		// Read batch
+		entries := make([]models.CSVLogEntry, currentBatchSize)
 		if err := pr.Read(&entries); err != nil {
+			p.metrics.linesFailed.Add(uint64(currentBatchSize))
 			continue
 		}
 
-		rowNum++
-		entry := entries[0]
-		row := p.entryToRow(&entry)
+		// Send batch to workers
+		for j := 0; j < currentBatchSize; j++ {
+			rowNum++
+			row := p.entryToRow(&entries[j])
 
-		select {
-		case <-ctx.Done():
-			return
-		case rawRows <- csvParseJob{rowNum: rowNum, row: row}:
+			select {
+			case <-ctx.Done():
+				return
+			case rawRows <- csvParseJob{rowNum: rowNum, row: row}:
+			default:
+				// Channel full - apply backpressure
+				select {
+				case <-ctx.Done():
+					return
+				case rawRows <- csvParseJob{rowNum: rowNum, row: row}:
+				}
+			}
 		}
 	}
 }
@@ -418,11 +452,13 @@ func (p *CSVParser) publishWorker(ctx context.Context, wg *sync.WaitGroup, produ
 	defer wg.Done()
 
 	const (
-		maxBatchSize  = 500
 		flushInterval = 500 * time.Millisecond
 		maxRetries    = 3
 		retryBackoff  = 250 * time.Millisecond
 	)
+
+	// Use configurable batch size
+	maxBatchSize := cfg.KafkaBatchSize
 
 	ticker := time.NewTicker(flushInterval)
 	defer ticker.Stop()

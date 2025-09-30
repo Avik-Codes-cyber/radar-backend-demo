@@ -29,6 +29,14 @@ type Config struct {
 
 	// Logging Configuration
 	LogLevel string `json:"log_level"`
+
+	// Performance Configuration
+	ParserWorkers        int `json:"parser_workers"`         // Number of parallel parser workers (0 = auto)
+	PublisherWorkers     int `json:"publisher_workers"`      // Number of Kafka publisher workers (0 = auto)
+	ParquetBatchSize     int `json:"parquet_batch_size"`     // Rows to read per Parquet batch
+	KafkaBatchSize       int `json:"kafka_batch_size"`       // Messages per Kafka batch
+	ProcessingTimeoutMin int `json:"processing_timeout_min"` // Max processing time in minutes
+	ChannelBufferSize    int `json:"channel_buffer_size"`    // Size of internal channels
 }
 
 // LoadConfig loads configuration from environment variables
@@ -54,6 +62,14 @@ func LoadConfig() *Config {
 
 		// Logging Configuration
 		LogLevel: getEnv("LOG_LEVEL", "info"),
+
+		// Performance Configuration
+		ParserWorkers:        getEnvAsInt("PARSER_WORKERS", 0),           // 0 = auto (NumCPU)
+		PublisherWorkers:     getEnvAsInt("PUBLISHER_WORKERS", 0),        // 0 = auto (NumCPU/2, min 3)
+		ParquetBatchSize:     getEnvAsInt("PARQUET_BATCH_SIZE", 1000),    // Read 1000 rows at a time
+		KafkaBatchSize:       getEnvAsInt("KAFKA_BATCH_SIZE", 500),       // Send 500 messages per batch
+		ProcessingTimeoutMin: getEnvAsInt("PROCESSING_TIMEOUT_MIN", 120), // 2 hours default
+		ChannelBufferSize:    getEnvAsInt("CHANNEL_BUFFER_SIZE", 10000),  // 10k buffer
 	}
 }
 
