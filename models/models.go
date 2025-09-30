@@ -8,7 +8,7 @@ import (
 type CEFLogEntry struct {
 	DeviceVendor  string    `json:"device_vendor"`
 	DeviceProduct string    `json:"device_product"`
-	EventID       string    `json:"event_id"`
+	SignatureID   string    `json:"signature_id"`
 	Severity      int       `int:"severity"`
 	Src           string    `json:"src"`
 	Dst           string    `json:"dst"`

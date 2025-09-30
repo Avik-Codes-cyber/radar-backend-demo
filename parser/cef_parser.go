@@ -44,7 +44,7 @@ func (p *CEFParser) ParseLogFileToJSON(inputPath, outputPath string) error {
 		entry := &models.CEFLogEntry{
 			DeviceVendor:  cef.DeviceVendor,
 			DeviceProduct: cef.DeviceProduct,
-			EventID:       cef.SignatureID,
+			SignatureID:   cef.SignatureID,
 			Severity:      severity,
 			Src:           extMap["src"],
 			Dst:           extMap["dst"],
