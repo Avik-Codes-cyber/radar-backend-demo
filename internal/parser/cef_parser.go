@@ -1,11 +1,16 @@
 package parser
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
+	"runtime"
 	"strconv"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/ren3gadem4rm0t/cef-parser-go/parser"
 	"superalign.ai/config"
@@ -13,7 +18,33 @@ import (
 	"superalign.ai/models"
 )
 
-type CEFParser struct{}
+type CEFParser struct {
+	metrics *ParserMetrics
+}
+
+type ParserMetrics struct {
+	linesProcessed    atomic.Uint64
+	linesFailed       atomic.Uint64
+	messagesPublished atomic.Uint64
+	messagesFailed    atomic.Uint64
+}
+
+func (m *ParserMetrics) Report() {
+	fmt.Printf("Parser Metrics - Processed: %d, Failed: %d, Published: %d, Publish Failed: %d\n",
+		m.linesProcessed.Load(), m.linesFailed.Load(),
+		m.messagesPublished.Load(), m.messagesFailed.Load())
+}
+
+type parseJob struct {
+	lineNum int
+	line    string
+}
+
+func NewCEFParser() *CEFParser {
+	return &CEFParser{
+		metrics: &ParserMetrics{},
+	}
+}
 
 func (p *CEFParser) ParseLogFileToJSON(inputPath, outputPath string) error {
 	file, err := os.Open(inputPath)
@@ -22,64 +53,236 @@ func (p *CEFParser) ParseLogFileToJSON(inputPath, outputPath string) error {
 	}
 	defer file.Close()
 
-	safeParser := parser.NewParser(parser.SafeConfig())
-
-	var results []*models.CEFLogEntry
-
-	// init kafka producer from env config
 	cfg := config.LoadConfig()
 	producer := kafka.NewProducerFromConfig(cfg)
 	defer producer.Close()
 
-	err = safeParser.ParseStream(file, func(cef *parser.CEF, parseErr error) bool {
-		if parseErr != nil {
-			// stop if bad log line
-			err = fmt.Errorf("failed to parse log: %w", parseErr)
-			return false
-		}
-
-		severity, _ := strconv.Atoi(cef.Severity)
-
-		// Get extensions as JSON and parse to map
-		extMap := make(map[string]string)
-		if cef.Extensions != nil {
-			extJSON := cef.Extensions.AsJSON()
-			json.Unmarshal([]byte(extJSON), &extMap)
-		}
-
-		entry := &models.CEFLogEntry{
-			DeviceVendor:  cef.DeviceVendor,
-			DeviceProduct: cef.DeviceProduct,
-			SignatureID:   cef.SignatureID,
-			Severity:      severity,
-			Src:           extMap["src"],
-			Dst:           extMap["dst"],
-			Name:          cef.Name,
-		}
-		results = append(results, entry)
-
-		// Publish each entry to Kafka as JSON
-		if b, mErr := json.Marshal(entry); mErr == nil {
-			_ = producer.PublishJSON(context.Background(), cfg.KafkaTopic, b)
-		}
-
-		return true // keep parsing
-	})
-
+	dlq, err := os.Create(outputPath)
 	if err != nil {
+		return fmt.Errorf("failed to create output file: %w", err)
+	}
+	defer dlq.Close()
+
+	dlqWriter := bufio.NewWriter(dlq)
+	defer dlqWriter.Flush()
+
+	// Use mutex for DLQ writes from multiple goroutines
+	var dlqMutex sync.Mutex
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Channels for pipeline stages
+	numWorkers := runtime.NumCPU()
+	if numWorkers < 2 {
+		numWorkers = 2
+	}
+
+	rawLines := make(chan parseJob, numWorkers*100)
+	entries := make(chan *models.CEFLogEntry, 4096)
+
+	var wg sync.WaitGroup
+	errChan := make(chan error, numWorkers+3)
+
+	// Stage 1: File reader - sequential read, feed to parser workers
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(rawLines)
+
+		scanner := bufio.NewScanner(file)
+		// Increase buffer size for large log lines
+		buf := make([]byte, 0, 64*1024)
+		scanner.Buffer(buf, 1024*1024)
+
+		lineNum := 0
+		for scanner.Scan() {
+			lineNum++
+			select {
+			case <-ctx.Done():
+				return
+			case rawLines <- parseJob{lineNum: lineNum, line: scanner.Text()}:
+			}
+		}
+
+		if err := scanner.Err(); err != nil {
+			select {
+			case errChan <- fmt.Errorf("scanner error: %w", err):
+			default:
+			}
+		}
+	}()
+
+	// Stage 2: Parser workers - parallel CEF parsing
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+
+			safeParser := parser.NewParser(parser.SafeConfig())
+
+			for job := range rawLines {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
+				cef, parseErr := safeParser.Parse(job.line)
+				p.metrics.linesProcessed.Add(1)
+
+				if parseErr != nil {
+					p.metrics.linesFailed.Add(1)
+					// Write unparseable line to DLQ
+					dlqMutex.Lock()
+					dlqWriter.WriteString(fmt.Sprintf(`{"error":"parse_failed","line":%d,"raw":"%s"}`+"\n",
+						job.lineNum, escapeJSON(job.line)))
+					dlqMutex.Unlock()
+					continue
+				}
+
+				severity, _ := strconv.Atoi(cef.Severity)
+				extMap := make(map[string]string)
+				if cef.Extensions != nil {
+					extJSON := cef.Extensions.AsJSON()
+					json.Unmarshal([]byte(extJSON), &extMap)
+				}
+
+				entry := &models.CEFLogEntry{
+					DeviceVendor:  cef.DeviceVendor,
+					DeviceProduct: cef.DeviceProduct,
+					SignatureID:   cef.SignatureID,
+					Severity:      severity,
+					Src:           extMap["src"],
+					Dst:           extMap["dst"],
+					Name:          cef.Name,
+				}
+
+				select {
+				case entries <- entry:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}(i)
+	}
+
+	// Stage 3: Publisher workers - parallel Kafka publishing with batching
+	numPublishers := 3
+	for i := 0; i < numPublishers; i++ {
+		wg.Add(1)
+		go func(publisherID int) {
+			defer wg.Done()
+
+			const (
+				maxBatchSize  = 500
+				flushInterval = 500 * time.Millisecond
+				maxRetries    = 3
+				retryBackoff  = 250 * time.Millisecond
+			)
+
+			ticker := time.NewTicker(flushInterval)
+			defer ticker.Stop()
+
+			batch := make([][]byte, 0, maxBatchSize)
+
+			flush := func() {
+				if len(batch) == 0 {
+					return
+				}
+
+				batchSize := len(batch)
+				for attempt := 0; attempt < maxRetries; attempt++ {
+					publishCtx, publishCancel := context.WithTimeout(ctx, 10*time.Second)
+					pubErr := producer.PublishJSONBatch(publishCtx, cfg.KafkaTopic, batch)
+					publishCancel()
+
+					if pubErr == nil {
+						p.metrics.messagesPublished.Add(uint64(batchSize))
+						batch = batch[:0]
+						return
+					}
+
+					if attempt < maxRetries-1 {
+						time.Sleep(retryBackoff * time.Duration(attempt+1))
+					}
+				}
+
+				// All retries failed - write to DLQ
+				p.metrics.messagesFailed.Add(uint64(batchSize))
+				dlqMutex.Lock()
+				for _, b := range batch {
+					dlqWriter.Write(b)
+					dlqWriter.WriteString("\n")
+				}
+				dlqMutex.Unlock()
+				batch = batch[:0]
+			}
+
+			for {
+				select {
+				case e, ok := <-entries:
+					if !ok {
+						flush()
+						return
+					}
+
+					b, err := json.Marshal(e)
+					if err != nil {
+						p.metrics.messagesFailed.Add(1)
+						continue
+					}
+
+					batch = append(batch, b)
+					if len(batch) >= maxBatchSize {
+						flush()
+					}
+
+				case <-ticker.C:
+					flush()
+
+				case <-ctx.Done():
+					flush()
+					return
+				}
+			}
+		}(i)
+	}
+
+	// Close entries channel after all parsers finish
+	go func() {
+		wg.Wait()
+		close(entries)
+	}()
+
+	// Wait for all goroutines with timeout
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Success
+	case err := <-errChan:
+		cancel()
+		<-done
 		return err
+	case <-time.After(5 * time.Minute):
+		cancel()
+		<-done
+		return fmt.Errorf("parsing timeout after 5 minutes")
 	}
 
-	// Marshal to JSON
-	data, err := json.MarshalIndent(results, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal logs to JSON: %w", err)
-	}
-
-	// Write JSON to file
-	if writeErr := os.WriteFile(outputPath, data, 0644); writeErr != nil {
-		return fmt.Errorf("failed to write JSON file: %w", writeErr)
-	}
+	// Report metrics
+	p.metrics.Report()
 
 	return nil
+}
+
+// escapeJSON escapes a string for embedding in JSON
+func escapeJSON(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b[1 : len(b)-1]) // Remove quotes
 }

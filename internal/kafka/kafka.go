@@ -34,6 +34,26 @@ func (p *Producer) PublishJSON(ctx context.Context, topic string, payload []byte
 	return p.writer.WriteMessages(ctx, msg)
 }
 
+// PublishJSONBatch writes a batch of JSON payloads in one call
+func (p *Producer) PublishJSONBatch(ctx context.Context, topic string, payloads [][]byte) error {
+	if len(payloads) == 0 {
+		return nil
+	}
+	msgs := make([]kafka.Message, 0, len(payloads))
+	for _, b := range payloads {
+		if b == nil {
+			continue
+		}
+		msgs = append(msgs, kafka.Message{Value: b})
+	}
+	if len(msgs) == 0 {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	return p.writer.WriteMessages(ctx, msgs...)
+}
+
 // Close flushes and closes the underlying writer
 func (p *Producer) Close() error {
 	if p == nil || p.writer == nil {
