@@ -40,20 +40,66 @@ class ClickHouseWriter:
         
        
         self.client.command("""
-            CREATE TABLE IF NOT EXISTS ai_tool_events (
-                ts DateTime DEFAULT now(),
-                event_time DateTime,
-                url String,
-                tool_id String,
-                tool_name String,
-                ai_category String,
-                payload String,
-                processed_at DateTime DEFAULT now()
-            ) ENGINE = MergeTree()
-            PARTITION BY toYYYYMM(ts)
-            ORDER BY (ts, url)
-            TTL ts + INTERVAL 90 DAY
+            create table if not exists tools (
+    tool_id UInt32,                   
+    url String,
+    name String,
+    score Float32,
+    risk LowCardinality(String),
+    ai_category LowCardinality(String),
+    
+    -- Metadata
+    updated_at DateTime DEFAULT now(),
+    created_at DateTime DEFAULT now()
+) ENGINE = MergeTree()
+PARTITION BY toYYYYMM(ts)
+ORDER BY (ts, url)
+TTL ts + INTERVAL 90 DAY
         """)
+
+        self.client.command(""" 
+        create table if not exists logs (
+    log_id UInt64,                     
+    
+        
+            date Date,
+            eventtime DateTime64(3),
+            
+            
+            tool_id UInt32,                   
+            
+        
+            sessionid String,
+            srcip IPv4,
+            srcname LowCardinality(String),
+            dstip IPv4,
+            dstname LowCardinality(String),
+            
+            -- Device Information
+            devtype LowCardinality(String),
+            osname LowCardinality(String),
+            devid String,
+            
+            -- Application Information
+            appcat LowCardinality(String),
+            app LowCardinality(String),
+            appid UInt32,
+            apprisk LowCardinality(String),
+            
+            
+            action LowCardinality(String),
+            logid UInt64,                      
+            type LowCardinality(String),
+            subtype LowCardinality(String),
+            
+            g
+            _inserted_at DateTime DEFAULT now()
+) ENGINE = MergeTree()
+PARTITION BY toYYYYMM(ts)
+ORDER BY (ts, url)
+TTL ts + INTERVAL 90 DAY
+        """)
+        
     
     def write_batch(self, events: List[Dict[str, Any]]):
         """Write batch with retry logic"""
