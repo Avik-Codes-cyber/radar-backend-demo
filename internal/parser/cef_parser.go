@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -141,7 +142,10 @@ func (p *CEFParser) ParseLogFileToJSON(inputPath, outputPath string) error {
 				default:
 				}
 
-				cef, parseErr := safeParser.Parse(job.line)
+				// Preprocess FortiGate CEF format (strip syslog wrapper, normalize)
+				line := PreprocessFortigateCEF(job.line)
+
+				cef, parseErr := safeParser.Parse(line)
 				p.metrics.linesProcessed.Add(1)
 
 				if parseErr != nil {
@@ -173,6 +177,13 @@ func (p *CEFParser) ParseLogFileToJSON(inputPath, outputPath string) error {
 							value := fmt.Sprintf("%v", v)
 							entry[k] = value
 
+							// Strip FTNTFGT prefix from FortiGate fields (e.g., FTNTFGTlogid → logid)
+							cleanKey := k
+							if strings.HasPrefix(k, "FTNTFGT") {
+								cleanKey = strings.TrimPrefix(k, "FTNTFGT")
+								entry[cleanKey] = value
+							}
+
 							// Map CEF standard fields to FortiGate field names for compatibility
 							switch k {
 							case "src":
@@ -197,6 +208,10 @@ func (p *CEFParser) ParseLogFileToJSON(inputPath, outputPath string) error {
 								entry["app"] = value
 							case "rt": // Receipt time (timestamp)
 								entry["eventtime"] = value
+							case "request": // request URL
+								if entry["url"] == "" {
+									entry["url"] = value
+								}
 							}
 						}
 					}
@@ -341,6 +356,72 @@ func (p *CEFParser) cefPublishWorker(ctx context.Context, wg *sync.WaitGroup, pr
 			return
 		}
 	}
+}
+
+func PreprocessFortigateCEF(line string) string {
+	// 1️⃣ Find and extract the CEF portion (with CEF: prefix)
+	cefIdx := strings.Index(line, "CEF:")
+	if cefIdx == -1 {
+		// Try with space
+		cefIdx = strings.Index(line, "CEF: ")
+		if cefIdx == -1 {
+			// No CEF marker found, return as-is
+			return line
+		}
+	}
+
+	// Extract from CEF: onwards
+	line = strings.TrimSpace(line[cefIdx:])
+
+	// 2️⃣ Normalize "CEF: " to "CEF:" (space after colon)
+	line = strings.Replace(line, "CEF: ", "CEF:", 1)
+
+	// 3️⃣ Check if this is valid CEF format
+	if !strings.HasPrefix(line, "CEF:") {
+		return line
+	}
+
+	withoutPrefix := strings.TrimPrefix(line, "CEF:")
+
+	// 4️⃣ Split into exactly 8 parts (Version + 7 pipe-separated fields)
+	// CEF format: Version|Device Vendor|Device Product|Device Version|Signature ID|Name|Severity|Extension
+	parts := strings.SplitN(withoutPrefix, "|", 8)
+
+	// Need at least 8 parts for valid CEF
+	if len(parts) < 8 {
+		// Pad with empty strings if needed
+		for len(parts) < 8 {
+			parts = append(parts, "")
+		}
+	}
+
+	// 5️⃣ Normalize the Name field (index 5, the 6th field after version)
+	// FortiGate often has spaces and special chars in Name field which violates CEF spec
+	if len(parts) > 0 && len(parts) > 5 {
+		parts[5] = strings.TrimSpace(parts[5])
+		// Replace problematic characters
+		parts[5] = strings.ReplaceAll(parts[5], " ", "_")
+		parts[5] = strings.ReplaceAll(parts[5], ":", "_")
+		parts[5] = strings.ReplaceAll(parts[5], "|", "_")
+		parts[5] = strings.ReplaceAll(parts[5], "=", "_")
+	}
+
+	// 6️⃣ Clean up Severity field (index 6)
+	if len(parts) > 6 {
+		parts[6] = strings.TrimSpace(parts[6])
+	}
+
+	// 7️⃣ Clean up extension field (index 7)
+	if len(parts) > 7 {
+		parts[7] = strings.TrimSpace(parts[7])
+	}
+
+	// 8️⃣ Reconstruct with CEF: prefix
+	result := "CEF:" + strings.Join(parts, "|")
+
+	fmt.Println("Preprocessed CEF: ", result)
+
+	return result
 }
 
 // escapeJSON escapes a string for embedding in JSON

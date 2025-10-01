@@ -418,16 +418,24 @@ func (p *SyslogParser) parseRFC5424(parser syslog.Machine, line string) (map[str
 	return entry, nil
 }
 
-// parseRFC3164 parses RFC3164 format syslog message
+// parseRFC3164 parses RFC3164 format syslog message OR raw FortiGate key=value logs
 func (p *SyslogParser) parseRFC3164(parser syslog.Machine, line string) (map[string]string, error) {
+	// Check if line starts with '<' (syslog priority)
+	// If not, treat it as raw FortiGate key=value format
+	if !strings.HasPrefix(strings.TrimSpace(line), "<") {
+		return p.parseRawFortiGate(line)
+	}
+
 	result, err := parser.Parse([]byte(line))
 	if err != nil {
-		return nil, err
+		// If syslog parsing fails, try parsing as raw FortiGate format
+		return p.parseRawFortiGate(line)
 	}
 
 	msg, ok := result.(*rfc3164.SyslogMessage)
 	if !ok || msg == nil {
-		return nil, fmt.Errorf("invalid message type or nil message")
+		// If syslog parsing fails, try parsing as raw FortiGate format
+		return p.parseRawFortiGate(line)
 	}
 
 	// Convert to dynamic map
@@ -468,6 +476,21 @@ func (p *SyslogParser) parseRFC3164(parser syslog.Machine, line string) (map[str
 
 			entry[key] = value
 		}
+	}
+
+	return entry, nil
+}
+
+// parseRawFortiGate parses raw FortiGate key=value format (without syslog wrapper)
+func (p *SyslogParser) parseRawFortiGate(line string) (map[string]string, error) {
+	entry := make(map[string]string)
+	entry["raw_log"] = line
+	entry["format"] = "fortigate-raw"
+
+	// Extract FortiGate key=value pairs
+	fortiFields := parseFortiRFC3164Message(line)
+	for key, value := range fortiFields {
+		entry[key] = value
 	}
 
 	return entry, nil
