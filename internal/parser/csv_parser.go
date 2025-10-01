@@ -10,7 +10,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"reflect"
 	"regexp"
 	"runtime"
 	"strings"
@@ -20,7 +19,6 @@ import (
 	_ "github.com/marcboeker/go-duckdb"
 	"superalign.ai/config"
 	"superalign.ai/internal/kafka"
-	"superalign.ai/models"
 )
 
 type CSVParser struct {
@@ -28,9 +26,9 @@ type CSVParser struct {
 }
 
 type csvParseJob struct {
-	rowNum    int
-	row       []string
-	headerMap map[string]int
+	rowNum  int
+	row     []string
+	headers []string
 }
 
 func NewCSVParser() *CSVParser {
@@ -145,7 +143,7 @@ func (p *CSVParser) ParseCSVToKafka(inputPath, dlqPath string, useParquet bool) 
 	// Use configurable buffer sizes for backpressure
 	bufferSize := cfg.ChannelBufferSize
 	rawRows := make(chan csvParseJob, bufferSize)
-	entries := make(chan *models.CSVLogEntry, bufferSize)
+	entries := make(chan map[string]string, bufferSize)
 
 	// Separate wait groups for parsers and publishers to avoid deadlock
 	var parserWg sync.WaitGroup
@@ -181,7 +179,7 @@ func (p *CSVParser) ParseCSVToKafka(inputPath, dlqPath string, useParquet bool) 
 					continue
 				}
 
-				entry := p.mapRowToEntry(job.row, job.headerMap)
+				entry := p.mapRowToDynamic(job.row, job.headers)
 
 				select {
 				case entries <- entry:
@@ -279,9 +277,7 @@ func (p *CSVParser) duckDBParquetReader(ctx context.Context, wg *sync.WaitGroup,
 
 	// Validate and build header map
 	fmt.Printf("Reading Parquet with DuckDB: %d columns, dynamic schema\n", len(columns))
-	validateHeaderMapping(columns, reflect.TypeOf(models.CSVLogEntry{}))
-
-	headerMap := buildHeaderMapFromRow(columns)
+	reportHeaders(columns)
 
 	// Prepare value holders
 	values := make([]interface{}, len(columns))
@@ -313,7 +309,7 @@ func (p *CSVParser) duckDBParquetReader(ctx context.Context, wg *sync.WaitGroup,
 		select {
 		case <-ctx.Done():
 			return
-		case rawRows <- csvParseJob{rowNum: rowNum, row: row, headerMap: headerMap}:
+		case rawRows <- csvParseJob{rowNum: rowNum, row: row, headers: columns}:
 		}
 	}
 
@@ -356,10 +352,8 @@ func (p *CSVParser) csvReader(ctx context.Context, wg *sync.WaitGroup, inputPath
 		return
 	}
 
-	// Validate header mapping (one-time debug output)
-	validateHeaderMapping(headerRow, reflect.TypeOf(models.CSVLogEntry{}))
-
-	headerMap := buildHeaderMapFromRow(headerRow)
+	// Report headers (one-time debug output)
+	reportHeaders(headerRow)
 
 	rowNum := 0
 	for {
@@ -375,7 +369,7 @@ func (p *CSVParser) csvReader(ctx context.Context, wg *sync.WaitGroup, inputPath
 		select {
 		case <-ctx.Done():
 			return
-		case rawRows <- csvParseJob{rowNum: rowNum, row: append([]string(nil), row...), headerMap: headerMap}:
+		case rawRows <- csvParseJob{rowNum: rowNum, row: append([]string(nil), row...), headers: headerRow}:
 		}
 	}
 }
@@ -383,7 +377,7 @@ func (p *CSVParser) csvReader(ctx context.Context, wg *sync.WaitGroup, inputPath
 // parquetReaderBatched reads Parquet files in batches for better performance
 
 func (p *CSVParser) publishWorker(ctx context.Context, wg *sync.WaitGroup, producer *kafka.Producer,
-	cfg *config.Config, entries chan *models.CSVLogEntry, dlqWriter *bufio.Writer, dlqMutex *sync.Mutex) {
+	cfg *config.Config, entries chan map[string]string, dlqWriter *bufio.Writer, dlqMutex *sync.Mutex) {
 	defer wg.Done()
 
 	const (
@@ -477,100 +471,37 @@ func normalizeHeader(s string) string {
 	return s
 }
 
-// buildHeaderMapFromRow builds a normalized header map from CSV/Parquet header row
-func buildHeaderMapFromRow(headerRow []string) map[string]int {
-	headerMap := make(map[string]int, len(headerRow))
-	for idx, h := range headerRow {
-		normalized := normalizeHeader(h)
-		headerMap[normalized] = idx
-		// Debug: show header normalization
-		if h != normalized {
-			fmt.Printf("Header mapping: '%s' → '%s' (index %d)\n", h, normalized, idx)
-		}
-	}
-	return headerMap
-}
+// mapRowToDynamic maps a CSV/Parquet row to a dynamic map
+func (p *CSVParser) mapRowToDynamic(row []string, headers []string) map[string]string {
+	entry := make(map[string]string, len(headers))
 
-// mapRowToEntry maps a CSV/Parquet row to a CSVLogEntry struct
-func (p *CSVParser) mapRowToEntry(row []string, headerMap map[string]int) *models.CSVLogEntry {
-	entry := &models.CSVLogEntry{}
-
-	if len(headerMap) == 0 || len(row) == 0 {
+	if len(headers) == 0 || len(row) == 0 {
 		return entry
 	}
 
-	v := reflect.ValueOf(entry).Elem() // struct value
-	t := v.Type()                      // struct type
-
-	for i := 0; i < t.NumField(); i++ {
-		field := t.Field(i)
-		fieldName := normalizeHeader(field.Name) // normalize struct field
-
-		if idx, ok := headerMap[fieldName]; ok && idx < len(row) {
-			fieldValue := row[idx]
-			if fieldValue != "" {
-				v.Field(i).SetString(fieldValue)
-			}
+	// Map each header to its corresponding value
+	for i, header := range headers {
+		if i < len(row) && row[i] != "" {
+			entry[header] = row[i]
 		}
 	}
 
 	return entry
 }
 
-// validateHeaderMapping shows which CSV headers map to struct fields and which are unmapped
-func validateHeaderMapping(csvHeaders []string, structType reflect.Type) {
-	fmt.Println("\n=== Header Mapping Validation ===")
+// reportHeaders reports the headers found in the CSV/Parquet file
+func reportHeaders(headers []string) {
+	fmt.Println("\n=== Dynamic CSV/Parquet Headers ===")
+	fmt.Printf("Found %d columns:\n", len(headers))
 
-	// Build struct field map
-	structFields := make(map[string]string) // normalized -> original field name
-	for i := 0; i < structType.NumField(); i++ {
-		field := structType.Field(i)
-		normalized := normalizeHeader(field.Name)
-		structFields[normalized] = field.Name
-	}
-
-	// Check CSV headers
-	mapped := 0
-	unmapped := []string{}
-
-	for _, csvHeader := range csvHeaders {
-		normalized := normalizeHeader(csvHeader)
-		if fieldName, ok := structFields[normalized]; ok {
-			mapped++
-			fmt.Printf("✓ CSV '%s' → Struct '%s'\n", csvHeader, fieldName)
+	for i, header := range headers {
+		normalized := normalizeHeader(header)
+		if header != normalized {
+			fmt.Printf("  %d. '%s' (normalized: '%s')\n", i+1, header, normalized)
 		} else {
-			unmapped = append(unmapped, csvHeader)
+			fmt.Printf("  %d. '%s'\n", i+1, header)
 		}
 	}
 
-	fmt.Printf("\nSummary: %d/%d headers mapped\n", mapped, len(csvHeaders))
-
-	if len(unmapped) > 0 {
-		fmt.Printf("\n⚠ Unmapped CSV headers (%d):\n", len(unmapped))
-		for _, h := range unmapped {
-			fmt.Printf("  - '%s' (normalized: '%s')\n", h, normalizeHeader(h))
-		}
-	}
-
-	// Check for struct fields without CSV headers
-	csvHeadersMap := make(map[string]bool)
-	for _, h := range csvHeaders {
-		csvHeadersMap[normalizeHeader(h)] = true
-	}
-
-	missingInCSV := []string{}
-	for normalized, fieldName := range structFields {
-		if !csvHeadersMap[normalized] {
-			missingInCSV = append(missingInCSV, fieldName)
-		}
-	}
-
-	if len(missingInCSV) > 0 {
-		fmt.Printf("\n⚠ Struct fields without CSV headers (%d):\n", len(missingInCSV))
-		for _, f := range missingInCSV {
-			fmt.Printf("  - %s (normalized: '%s')\n", f, normalizeHeader(f))
-		}
-	}
-
-	fmt.Println("=== End Validation ===")
+	fmt.Println("=== All columns will be dynamically mapped ===")
 }

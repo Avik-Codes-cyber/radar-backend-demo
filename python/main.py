@@ -378,6 +378,7 @@ class EnrichWithToolMetadata(BroadcastProcessFunction):
             value.get("url") or 
             value.get("URL") or 
             value.get("tool_url") or 
+            value.get("hostname") or
             ""
         )
         url_key = str(url_val).lower().strip()
