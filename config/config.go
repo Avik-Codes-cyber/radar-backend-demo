@@ -37,6 +37,11 @@ type Config struct {
 	KafkaBatchSize       int `json:"kafka_batch_size"`       // Messages per Kafka batch
 	ProcessingTimeoutMin int `json:"processing_timeout_min"` // Max processing time in minutes
 	ChannelBufferSize    int `json:"channel_buffer_size"`    // Size of internal channels
+
+	// Syslog Server Configuration
+	SyslogServerEnabled  bool   `json:"syslog_server_enabled"`  // Enable syslog server mode
+	SyslogServerProtocol string `json:"syslog_server_protocol"` // "udp" or "tcp"
+	SyslogServerPort     int    `json:"syslog_server_port"`     // Port to listen on (default 514)
 }
 
 // LoadConfig loads configuration from environment variables
@@ -70,6 +75,11 @@ func LoadConfig() *Config {
 		KafkaBatchSize:       getEnvAsInt("KAFKA_BATCH_SIZE", 500),       // Send 500 messages per batch
 		ProcessingTimeoutMin: getEnvAsInt("PROCESSING_TIMEOUT_MIN", 120), // 2 hours default
 		ChannelBufferSize:    getEnvAsInt("CHANNEL_BUFFER_SIZE", 10000),  // 10k buffer
+
+		// Syslog Server Configuration
+		SyslogServerEnabled:  getEnvAsBool("SYSLOG_SERVER_ENABLED", false), // Disabled by default
+		SyslogServerProtocol: getEnv("SYSLOG_SERVER_PROTOCOL", "udp"),      // UDP is standard for syslog
+		SyslogServerPort:     getEnvAsInt("SYSLOG_SERVER_PORT", 514),       // Standard syslog port
 	}
 }
 

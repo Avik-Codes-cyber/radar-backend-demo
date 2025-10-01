@@ -10,6 +10,8 @@ require (
 	github.com/xitongsys/parquet-go-source v0.0.0-20241021075129-b732d2ac9c9b
 )
 
+require github.com/leodido/go-syslog/v4 v4.2.0 // indirect
+
 require (
 	github.com/apache/arrow-go/v18 v18.1.0 // indirect
 	github.com/apache/arrow/go/arrow v0.0.0-20200730104253-651201b0f516 // indirect
