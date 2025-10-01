@@ -170,7 +170,34 @@ func (p *CEFParser) ParseLogFileToJSON(inputPath, outputPath string) error {
 					var extMap map[string]interface{}
 					if json.Unmarshal([]byte(extJSON), &extMap) == nil {
 						for k, v := range extMap {
-							entry[k] = fmt.Sprintf("%v", v)
+							value := fmt.Sprintf("%v", v)
+							entry[k] = value
+
+							// Map CEF standard fields to FortiGate field names for compatibility
+							switch k {
+							case "src":
+								entry["srcip"] = value
+							case "dst":
+								entry["dstip"] = value
+							case "spt":
+								entry["srcport"] = value
+							case "dpt":
+								entry["dstport"] = value
+							case "act":
+								entry["action"] = value
+							case "deviceHostName":
+								entry["devid"] = value
+							case "cs1": // Custom string 1 often used for URL
+								entry["url"] = value
+							case "destinationDnsDomain", "dhost":
+								entry["dstname"] = value
+							case "sourceHostName", "shost":
+								entry["srcname"] = value
+							case "deviceProcessName", "sproc":
+								entry["app"] = value
+							case "rt": // Receipt time (timestamp)
+								entry["eventtime"] = value
+							}
 						}
 					}
 				}

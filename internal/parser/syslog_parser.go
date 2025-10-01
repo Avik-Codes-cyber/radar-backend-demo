@@ -465,8 +465,8 @@ func (p *SyslogParser) parseRFC3164(parser syslog.Machine, line string) (map[str
 		// Extract FortiGate key=value pairs from message
 		fortiFields := parseFortiRFC3164Message(*msg.Message)
 		for key, value := range fortiFields {
-			// Prefix with "forti_" to distinguish from standard syslog fields
-			entry["forti_"+key] = value
+
+			entry[key] = value
 		}
 	}
 
@@ -479,7 +479,12 @@ func parseFortiRFC3164Message(msg string) map[string]string {
 	for _, kv := range strings.Fields(msg) {
 		parts := strings.SplitN(kv, "=", 2)
 		if len(parts) == 2 {
-			result[parts[0]] = parts[1]
+			// Remove surrounding quotes from value if present
+			value := parts[1]
+			if len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"' {
+				value = value[1 : len(value)-1]
+			}
+			result[parts[0]] = value
 		}
 	}
 	return result
