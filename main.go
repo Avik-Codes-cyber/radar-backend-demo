@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/joho/godotenv"
 	"superalign.ai/config"
@@ -25,6 +26,11 @@ func main() {
 
 	// Load configuration
 	cfg := config.LoadConfig()
+
+	// Ensure required directories exist
+	if err := ensureDirectories(); err != nil {
+		log.Fatalf("Failed to create required directories: %v", err)
+	}
 
 	// Check if server mode is enabled
 	if cfg.SyslogServerEnabled {
@@ -207,4 +213,72 @@ func detectLogFormat(inputPath string) (string, error) {
 	}
 
 	return "", fmt.Errorf("unable to detect log format")
+}
+
+// ensureDirectories creates necessary directories and checks disk space
+func ensureDirectories() error {
+	// Create uploads directory for DLQ files and temp files
+	uploadDir := "uploads"
+	if err := os.MkdirAll(uploadDir, 0755); err != nil {
+		return fmt.Errorf("failed to create uploads directory: %w", err)
+	}
+
+	// Check available disk space (warn if less than 1GB)
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(uploadDir, &stat); err == nil {
+		// Available space in bytes
+		availableSpace := stat.Bavail * uint64(stat.Bsize)
+		availableGB := float64(availableSpace) / (1024 * 1024 * 1024)
+
+		fmt.Printf("Temp directory: %s\n", uploadDir)
+		fmt.Printf("Available disk space: %.2f GB\n", availableGB)
+
+		if availableGB < 1.0 {
+			return fmt.Errorf("insufficient disk space: %.2f GB available, need at least 1 GB", availableGB)
+		}
+
+		if availableGB < 10.0 {
+			log.Printf("⚠️  WARNING: Low disk space (%.2f GB available). Monitor closely.\n", availableGB)
+		}
+	} else {
+		log.Printf("Warning: Could not check disk space: %v\n", err)
+	}
+
+	// Clean up old temp files (optional - keep last 24 hours)
+	cleanupOldTempFiles(uploadDir)
+
+	return nil
+}
+
+// cleanupOldTempFiles removes temporary files older than 24 hours
+func cleanupOldTempFiles(dir string) {
+	cutoffTime := time.Now().Add(-24 * time.Hour)
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		log.Printf("Warning: Could not read directory for cleanup: %v\n", err)
+		return
+	}
+
+	removedCount := 0
+	for _, entry := range entries {
+		// Only clean up temp buffer files
+		if strings.Contains(entry.Name(), "_buffer_") || strings.Contains(entry.Name(), "_stream_") {
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+
+			if info.ModTime().Before(cutoffTime) {
+				filePath := filepath.Join(dir, entry.Name())
+				if err := os.Remove(filePath); err == nil {
+					removedCount++
+				}
+			}
+		}
+	}
+
+	if removedCount > 0 {
+		fmt.Printf("Cleaned up %d old temporary files\n", removedCount)
+	}
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -460,9 +461,28 @@ func (p *SyslogParser) parseRFC3164(parser syslog.Machine, line string) (map[str
 	}
 	if msg.Message != nil {
 		entry["message"] = *msg.Message
+
+		// Extract FortiGate key=value pairs from message
+		fortiFields := parseFortiRFC3164Message(*msg.Message)
+		for key, value := range fortiFields {
+			// Prefix with "forti_" to distinguish from standard syslog fields
+			entry["forti_"+key] = value
+		}
 	}
 
 	return entry, nil
+}
+
+// parseFortiRFC3164Message extracts key=value pairs from FortiGate log messages
+func parseFortiRFC3164Message(msg string) map[string]string {
+	result := make(map[string]string)
+	for _, kv := range strings.Fields(msg) {
+		parts := strings.SplitN(kv, "=", 2)
+		if len(parts) == 2 {
+			result[parts[0]] = parts[1]
+		}
+	}
+	return result
 }
 
 // publishWorker publishes messages to Kafka with batching and retries
@@ -471,10 +491,11 @@ func (p *SyslogParser) publishWorker(ctx context.Context, wg *sync.WaitGroup, pr
 	defer wg.Done()
 
 	const (
-		flushInterval = 500 * time.Millisecond
-		maxRetries    = 3
-		retryBackoff  = 250 * time.Millisecond
+		maxRetries   = 3
+		retryBackoff = 250 * time.Millisecond
 	)
+
+	flushInterval := time.Duration(cfg.PublishFlushIntervalMs) * time.Millisecond
 
 	maxBatchSize := cfg.KafkaBatchSize
 	if maxBatchSize == 0 {

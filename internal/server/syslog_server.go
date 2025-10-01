@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"superalign.ai/config"
@@ -24,6 +25,11 @@ type SyslogServer struct {
 	port       int
 	cancelFunc context.CancelFunc
 	wg         sync.WaitGroup
+
+	// Metrics for monitoring UDP drops and performance
+	messagesReceived atomic.Uint64
+	messagesDropped  atomic.Uint64
+	messagesQueued   atomic.Uint64
 }
 
 // NewSyslogServer creates a new syslog server instance
@@ -48,6 +54,12 @@ func (s *SyslogServer) Start(ctx context.Context) error {
 
 	addr := fmt.Sprintf(":%d", s.port)
 	fmt.Printf("Starting syslog server on %s %s...\n", s.protocol, addr)
+
+	// Start metrics reporter for UDP
+	if s.protocol == "udp" {
+		s.wg.Add(1)
+		go s.reportMetrics(ctx)
+	}
 
 	if s.protocol == "udp" {
 		return s.startUDP(ctx, addr)
@@ -113,14 +125,18 @@ func (s *SyslogServer) startUDP(ctx context.Context, addr string) error {
 		message = strings.TrimSpace(message)
 
 		if message != "" {
+			s.messagesReceived.Add(1)
 			select {
 			case messageChan <- message:
 				// Successfully queued
+				s.messagesQueued.Add(1)
 			case <-ctx.Done():
 				close(messageChan)
 				return nil
 			default:
-				log.Printf("Message channel full, dropping message from %s\n", addr)
+				s.messagesDropped.Add(1)
+				log.Printf("Message channel full, dropping message from %s (total dropped: %d)\n",
+					addr, s.messagesDropped.Load())
 			}
 		}
 	}
@@ -223,8 +239,11 @@ func (s *SyslogServer) processMessages(ctx context.Context, messageChan chan str
 	defer tempFile.Close()
 
 	writer := bufio.NewWriter(tempFile)
-	ticker := time.NewTicker(1 * time.Second) // Process batch every second
+	flushInterval := time.Duration(s.cfg.FlushIntervalMs) * time.Millisecond
+	ticker := time.NewTicker(flushInterval)
 	defer ticker.Stop()
+
+	fmt.Printf("Message processing flush interval: %dms (real-time mode)\n", s.cfg.FlushIntervalMs)
 
 	messageCount := 0
 	var format string
@@ -337,7 +356,8 @@ func (s *SyslogServer) processCEFStream(ctx context.Context, reader *bufio.Reade
 	defer tempFile.Close()
 
 	writer := bufio.NewWriter(tempFile)
-	ticker := time.NewTicker(1 * time.Second)
+	flushInterval := time.Duration(s.cfg.FlushIntervalMs) * time.Millisecond
+	ticker := time.NewTicker(flushInterval)
 	defer ticker.Stop()
 
 	lineCount := 0
@@ -397,4 +417,39 @@ func (s *SyslogServer) processCEFStream(ctx context.Context, reader *bufio.Reade
 	}
 
 	return nil
+}
+
+// reportMetrics periodically reports server performance metrics
+func (s *SyslogServer) reportMetrics(ctx context.Context) {
+	defer s.wg.Done()
+
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			received := s.messagesReceived.Load()
+			dropped := s.messagesDropped.Load()
+			queued := s.messagesQueued.Load()
+
+			if received > 0 {
+				dropRate := float64(dropped) / float64(received) * 100
+				fmt.Printf("\n=== Syslog Server Metrics ===\n")
+				fmt.Printf("Messages Received: %d\n", received)
+				fmt.Printf("Messages Queued:   %d\n", queued)
+				fmt.Printf("Messages Dropped:  %d (%.2f%%)\n", dropped, dropRate)
+
+				if dropRate > 1.0 {
+					fmt.Printf("⚠️  WARNING: High drop rate detected! Consider:\n")
+					fmt.Printf("   - Increasing CHANNEL_BUFFER_SIZE (current: %d)\n", s.cfg.ChannelBufferSize)
+					fmt.Printf("   - Adding more PARSER_WORKERS\n")
+					fmt.Printf("   - Adding more PUBLISHER_WORKERS\n")
+				}
+				fmt.Printf("=============================\n\n")
+			}
+		}
+	}
 }

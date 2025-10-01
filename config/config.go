@@ -42,6 +42,10 @@ type Config struct {
 	SyslogServerEnabled  bool   `json:"syslog_server_enabled"`  // Enable syslog server mode
 	SyslogServerProtocol string `json:"syslog_server_protocol"` // "udp" or "tcp"
 	SyslogServerPort     int    `json:"syslog_server_port"`     // Port to listen on (default 514)
+
+	// Real-time Processing Configuration
+	FlushIntervalMs        int `json:"flush_interval_ms"`         // Message buffer flush interval in milliseconds (default 100ms for real-time)
+	PublishFlushIntervalMs int `json:"publish_flush_interval_ms"` // Kafka publish flush interval in milliseconds (default 200ms)
 }
 
 // LoadConfig loads configuration from environment variables
@@ -80,6 +84,10 @@ func LoadConfig() *Config {
 		SyslogServerEnabled:  getEnvAsBool("SYSLOG_SERVER_ENABLED", false), // Disabled by default
 		SyslogServerProtocol: getEnv("SYSLOG_SERVER_PROTOCOL", "udp"),      // UDP is standard for syslog
 		SyslogServerPort:     getEnvAsInt("SYSLOG_SERVER_PORT", 514),       // Standard syslog port
+
+		// Real-time Processing Configuration
+		FlushIntervalMs:        getEnvAsInt("FLUSH_INTERVAL_MS", 100),         // 100ms for real-time (was 1000ms)
+		PublishFlushIntervalMs: getEnvAsInt("PUBLISH_FLUSH_INTERVAL_MS", 200), // 200ms for Kafka batching
 	}
 }
 
