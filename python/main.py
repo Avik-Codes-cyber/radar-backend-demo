@@ -2,6 +2,7 @@ import json
 import os
 from typing import Dict, Any, List, Tuple
 from datetime import datetime
+from dotenv import load_dotenv
 
 from pyflink.common import Types, Time
 from pyflink.datastream import StreamExecutionEnvironment, RuntimeContext
@@ -13,6 +14,8 @@ from pyflink.datastream.window import TumblingProcessingTimeWindows
 
 from supabase import create_client
 import clickhouse_connect
+
+load_dotenv()
 
 
 
@@ -38,115 +41,233 @@ class ClickHouseWriter:
             database=database
         )
         
-       
+        # Tools reference table (synced from Supabase)
         self.client.command("""
-            create table if not exists tools (
-    tool_id UInt32,                   
-    url String,
-    name String,
-    score Float32,
-    risk LowCardinality(String),
-    ai_category LowCardinality(String),
-    
-    -- Metadata
-    updated_at DateTime DEFAULT now(),
-    created_at DateTime DEFAULT now()
-) ENGINE = MergeTree()
-PARTITION BY toYYYYMM(ts)
-ORDER BY (ts, url)
-TTL ts + INTERVAL 90 DAY
+            CREATE TABLE IF NOT EXISTS tools (
+                tool_id UInt32,
+                url String,
+                name String,
+                score Float32,
+                risk LowCardinality(String),
+                ai_category LowCardinality(String),
+                updated_at DateTime DEFAULT now(),
+                created_at DateTime DEFAULT now()
+            ) ENGINE = ReplacingMergeTree(updated_at)
+            ORDER BY (tool_id, url)
+            SETTINGS index_granularity = 8192
         """)
 
-        self.client.command(""" 
-        create table if not exists logs (
-    log_id UInt64,                     
-    
-        
-            date Date,
-            eventtime DateTime64(3),
-            
-            
-            tool_id UInt32,                   
-            
-        
-            sessionid String,
-            srcip IPv4,
-            srcname LowCardinality(String),
-            dstip IPv4,
-            dstname LowCardinality(String),
-            
-            -- Device Information
-            devtype LowCardinality(String),
-            osname LowCardinality(String),
-            devid String,
-            
-            -- Application Information
-            appcat LowCardinality(String),
-            app LowCardinality(String),
-            appid UInt32,
-            apprisk LowCardinality(String),
-            
-            
-            action LowCardinality(String),
-            logid UInt64,                      
-            type LowCardinality(String),
-            subtype LowCardinality(String),
-            
-            g
-            _inserted_at DateTime DEFAULT now()
-) ENGINE = MergeTree()
-PARTITION BY toYYYYMM(ts)
-ORDER BY (ts, url)
-TTL ts + INTERVAL 90 DAY
+        # Main logs table with denormalized tool metadata
+        self.client.command("""
+            CREATE TABLE IF NOT EXISTS logs (
+                -- Primary identifiers
+                log_id UInt64,
+                
+                -- Time fields
+                date Date,
+                eventtime DateTime64(3),
+                time String,
+                
+                -- Tool metadata (denormalized from tools table)
+                tool_id UInt32,
+                tool_name LowCardinality(String),
+                tool_url String,
+                tool_score Float32,
+                tool_risk LowCardinality(String),
+                tool_ai_category LowCardinality(String),
+                
+                -- Session information
+                sessionid String,
+                duration UInt32,
+                
+                -- Source information
+                srcip IPv4,
+                srcname LowCardinality(String),
+                srcport UInt16,
+                srcintf LowCardinality(String),
+                srcintfrole LowCardinality(String),
+                srccountry LowCardinality(String),
+                srcmac String,
+                
+                -- Device information
+                devtype LowCardinality(String),
+                osname LowCardinality(String),
+                devid String,
+                
+                -- Destination information
+                dstip IPv4,
+                dstname LowCardinality(String),
+                dstport UInt16,
+                dstintf LowCardinality(String),
+                dstintfrole LowCardinality(String),
+                dstcountry LowCardinality(String),
+                
+                -- Application information
+                appcat LowCardinality(String),
+                app LowCardinality(String),
+                appid UInt32,
+                apprisk LowCardinality(String),
+                
+                -- Action information
+                action LowCardinality(String),
+                policyid UInt32,
+                policytype LowCardinality(String),
+                
+                -- Log metadata
+                type LowCardinality(String),
+                subtype LowCardinality(String),
+                level LowCardinality(String),
+                proto UInt8,
+                
+                -- Data transfer
+                rcvdbyte UInt64,
+                rcvdpkt UInt64,
+                sentbyte UInt64,
+                sentpkt UInt64,
+                
+                -- System metadata
+                _inserted_at DateTime DEFAULT now()
+            ) ENGINE = MergeTree()
+            PARTITION BY toYYYYMM(date)
+            ORDER BY (date, eventtime, tool_id, srcip)
+            TTL date + INTERVAL 90 DAY
+            SETTINGS index_granularity = 8192
         """)
         
     
     def write_batch(self, events: List[Dict[str, Any]]):
-        """Write batch with retry logic"""
+        """Write batch of logs to ClickHouse with all required fields"""
         if not events:
             return
         
         try:
             data = []
             for e in events:
-                url_val = (
-                    e.get("url") or 
-                    e.get("URL") or 
-                    e.get("tool_url") or 
-                    ""
-                )
-                url_str = str(url_val).strip()
-                
-                # Extract metadata
-                tool_id = str(e.get("tool_id", ""))
-                tool_name = str(e.get("tool_name", ""))
-                ai_category = str(e.get("ai_category", ""))
-                
-                # Handle event timestamp
-                event_ts = e.get("timestamp") or e.get("event_time")
+                # Parse date and time from eventtime
+                event_ts = e.get("eventtime") or e.get("timestamp")
                 if event_ts:
-                    event_time = datetime.fromisoformat(str(event_ts).replace('Z', '+00:00'))
+                    try:
+                        if isinstance(event_ts, str):
+                            event_time = datetime.fromisoformat(event_ts.replace('Z', '+00:00'))
+                        elif isinstance(event_ts, (int, float)):
+                            event_time = datetime.fromtimestamp(event_ts)
+                        else:
+                            event_time = datetime.now()
+                    except:
+                        event_time = datetime.now()
                 else:
                     event_time = datetime.now()
                 
-                payload = json.dumps(e, ensure_ascii=False)
+                event_date = event_time.date()
+                time_str = e.get("time", event_time.strftime("%H:%M:%S"))
                 
-                data.append([
+                # Helper function to safely convert to IPv4
+                def to_ipv4(val):
+                    try:
+                        return str(val) if val else "0.0.0.0"
+                    except:
+                        return "0.0.0.0"
+                
+                # Helper to safely convert integers
+                def to_uint(val, default=0):
+                    try:
+                        return int(val) if val else default
+                    except:
+                        return default
+                
+                # Helper to safely convert floats
+                def to_float(val, default=0.0):
+                    try:
+                        return float(val) if val else default
+                    except:
+                        return default
+                
+                # Build row with all fields
+                row = [
+                    # Primary identifiers
+                    to_uint(e.get("logid", 0)),
+                    
+                    # Time fields
+                    event_date,
                     event_time,
-                    url_str,
-                    tool_id,
-                    tool_name,
-                    ai_category,
-                    payload
-                ])
+                    time_str,
+                    
+                    # Tool metadata (enriched from Supabase)
+                    to_uint(e.get("tool_id", 0)),
+                    str(e.get("tool_name", "")),
+                    str(e.get("tool_url", "")),
+                    to_float(e.get("tool_score", 0.0)),
+                    str(e.get("tool_risk", "")),
+                    str(e.get("tool_ai_category", "")),
+                    
+                    # Session information
+                    str(e.get("sessionid", "")),
+                    to_uint(e.get("duration", 0)),
+                    
+                    # Source information
+                    to_ipv4(e.get("srcip")),
+                    str(e.get("srcname", "")),
+                    to_uint(e.get("srcport", 0)),
+                    str(e.get("srcintf", "")),
+                    str(e.get("srcintfrole", "")),
+                    str(e.get("srccountry", "")),
+                    str(e.get("srcmac", "")),
+                    
+                    # Device information
+                    str(e.get("devtype", "")),
+                    str(e.get("osname", "")),
+                    str(e.get("devid", "")),
+                    
+                    # Destination information
+                    to_ipv4(e.get("dstip")),
+                    str(e.get("dstname", "")),
+                    to_uint(e.get("dstport", 0)),
+                    str(e.get("dstintf", "")),
+                    str(e.get("dstintfrole", "")),
+                    str(e.get("dstcountry", "")),
+                    
+                    # Application information
+                    str(e.get("appcat", "")),
+                    str(e.get("app", "")),
+                    to_uint(e.get("appid", 0)),
+                    str(e.get("apprisk", "")),
+                    
+                    # Action information
+                    str(e.get("action", "")),
+                    to_uint(e.get("policyid", 0)),
+                    str(e.get("policytype", "")),
+                    
+                    # Log metadata
+                    str(e.get("type", "")),
+                    str(e.get("subtype", "")),
+                    str(e.get("level", "")),
+                    to_uint(e.get("proto", 0)),
+                    
+                    # Data transfer
+                    to_uint(e.get("rcvdbyte", 0)),
+                    to_uint(e.get("rcvdpkt", 0)),
+                    to_uint(e.get("sentbyte", 0)),
+                    to_uint(e.get("sentpkt", 0)),
+                ]
+                
+                data.append(row)
             
             if data:
-                self.client.insert(
-                    "ai_tool_events",
-                    data,
-                    column_names=["event_time", "url", "tool_id", "tool_name", "ai_category", "payload"]
-                )
-                print(f"✓ Written {len(data)} events to ClickHouse")
+                column_names = [
+                    "log_id", "date", "eventtime", "time",
+                    "tool_id", "tool_name", "tool_url", "tool_score", "tool_risk", "tool_ai_category",
+                    "sessionid", "duration",
+                    "srcip", "srcname", "srcport", "srcintf", "srcintfrole", "srccountry", "srcmac",
+                    "devtype", "osname", "devid",
+                    "dstip", "dstname", "dstport", "dstintf", "dstintfrole", "dstcountry",
+                    "appcat", "app", "appid", "apprisk",
+                    "action", "policyid", "policytype",
+                    "type", "subtype", "level", "proto",
+                    "rcvdbyte", "rcvdpkt", "sentbyte", "sentpkt"
+                ]
+                
+                self.client.insert("logs", data, column_names=column_names)
+                print(f"✓ Written {len(data)} logs to ClickHouse")
         
         except Exception as e:
             print(f"✗ ClickHouse write error: {e}")
@@ -157,34 +278,74 @@ TTL ts + INTERVAL 90 DAY
             except Exception as retry_err:
                 print(f"✗ Retry failed: {retry_err}")
                 raise
+    
+    def sync_tools(self, tools: List[Dict[str, Any]]):
+        """Sync tools from Supabase to ClickHouse tools table"""
+        if not tools:
+            return
+        
+        try:
+            data = []
+            for tool in tools:
+                row = [
+                    int(tool.get("id", 0)),
+                    str(tool.get("url", "")),
+                    str(tool.get("name", "")),
+                    float(tool.get("score", 0.0)),
+                    str(tool.get("risk", "")),
+                    str(tool.get("ai_category", "")),
+                ]
+                data.append(row)
+            
+            if data:
+                self.client.insert(
+                    "tools",
+                    data,
+                    column_names=["tool_id", "url", "name", "score", "risk", "ai_category"]
+                )
+                print(f"✓ Synced {len(data)} tools to ClickHouse")
+        
+        except Exception as e:
+            print(f"✗ Tools sync error: {e}")
 
 
 
-def load_supabase_tools() -> Dict[str, Dict[str, Any]]:
-    """Load tools metadata from Supabase"""
+def load_supabase_tools() -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
+    """Load tools metadata from Supabase
+    
+    Returns:
+        Tuple of (url_lookup_dict, tools_list)
+        - url_lookup_dict: For enrichment by URL
+        - tools_list: For syncing to ClickHouse tools table
+    """
     url = os.getenv("SUPABASE_URL", "")
-    key = os.getenv("SUPABASE_ANON_KEY", "")
+    key = os.getenv("SUPABASE_ANONKEY", "")
     
     if not url or not key:
         print("⚠ Supabase credentials not found, returning empty tools")
-        return {}
+        return {}, []
     
     try:
         client = create_client(url, key)
-        resp = client.table("tools").select("id,name,url,has_ai,ai_category").execute()
+        resp = client.table("tools").select(
+            "id,name,url,has_ai,ai_category,score,risk"
+        ).execute()
         
-        tools = {}
+        tools_lookup = {}
+        tools_list = []
+        
         for row in resp.data or []:
             url_key = (row.get("url") or "").lower().strip()
             if url_key:
-                tools[url_key] = row
+                tools_lookup[url_key] = row
+                tools_list.append(row)
         
-        print(f"✓ Loaded {len(tools)} tools from Supabase")
-        return tools
+        print(f"✓ Loaded {len(tools_lookup)} tools from Supabase")
+        return tools_lookup, tools_list
     
     except Exception as e:
         print(f"✗ Error loading Supabase tools: {e}")
-        return {}
+        return {}, []
 
 
 # Flink Functions
@@ -211,7 +372,9 @@ class EnrichWithToolMetadata(BroadcastProcessFunction):
             MapStateDescriptor("tools-metadata", Types.STRING(), Types.PICKLED_BYTE_ARRAY())
         )
         
+        # Extract URL from various possible fields
         url_val = (
+            value.get("dstname") or  # Primary: destination name from firewall logs
             value.get("url") or 
             value.get("URL") or 
             value.get("tool_url") or 
@@ -236,7 +399,10 @@ class EnrichWithToolMetadata(BroadcastProcessFunction):
                 enriched = dict(value)
                 enriched["tool_id"] = tool_meta.get("id", "")
                 enriched["tool_name"] = tool_meta.get("name", "")
-                enriched["ai_category"] = tool_meta.get("ai_category", "")
+                enriched["tool_url"] = url_val
+                enriched["tool_ai_category"] = tool_meta.get("ai_category", "")
+                enriched["tool_score"] = tool_meta.get("score", 0.0)
+                enriched["tool_risk"] = tool_meta.get("risk", "")
                 yield enriched
     
     def process_broadcast_element(self, value: Dict[str, Any], ctx: 'BroadcastProcessFunction.Context'):
@@ -279,7 +445,7 @@ class WindowBatchWriter(ProcessWindowFunction):
 # Main Pipeline
 def main():
     # Configuration
-    topic = os.getenv("KAFKA_TOPIC", "tools-events")
+    topic = os.getenv("KAFKA_TOPIC", "log-processing")
     bootstrap = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
     parallelism = int(os.getenv("FLINK_PARALLELISM", "2"))
     window_seconds = int(os.getenv("WINDOW_SECONDS", "30"))  # Flush every 30 seconds
@@ -297,7 +463,7 @@ def main():
     source = KafkaSource.builder() \
         .set_bootstrap_servers(bootstrap) \
         .set_topics(topic) \
-        .set_group_id(os.getenv("KAFKA_GROUP_ID", "flink-tools-consumer")) \
+        .set_group_id(os.getenv("KAFKA_GROUP_ID", "flink-log-consumer")) \
         .set_starting_offsets(KafkaOffsetsInitializer.latest()) \
         .set_value_only_deserializer(SimpleStringSchema()) \
         .build()
@@ -305,7 +471,7 @@ def main():
     kafka_stream = env.from_source(
         source,
         watermark_strategy=None,
-        source_name="kafka-tools-source"
+        source_name="kafka-log-source"
     )
     
     # Parsing JSON
@@ -314,17 +480,21 @@ def main():
         output_type=Types.PICKLED_BYTE_ARRAY()
     )
     
-    # Loading tools metadata
-    tools_lookup = load_supabase_tools()
+    # Loading tools metadata from Supabase
+    tools_lookup, tools_list = load_supabase_tools()
     
-   
+    # Sync tools to ClickHouse for reference
+    if tools_list:
+        writer = ClickHouseWriter()
+        writer.sync_tools(tools_list)
+        print(f"✓ Initial tools sync to ClickHouse complete")
+    
     # Creating broadcast descriptor
     tools_broadcast_descriptor = MapStateDescriptor(
         "tools-metadata",
         Types.STRING(),
         Types.PICKLED_BYTE_ARRAY()
     )
-    
     
     # Creating broadcast stream
     tools_stream = env.from_collection([tools_lookup])
