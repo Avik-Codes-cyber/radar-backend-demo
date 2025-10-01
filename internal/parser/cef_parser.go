@@ -413,13 +413,51 @@ func PreprocessFortigateCEF(line string) string {
 
 	// 7️⃣ Clean up extension field (index 7)
 	if len(parts) > 7 {
-		parts[7] = strings.TrimSpace(parts[7])
+		extension := strings.TrimSpace(parts[7])
+
+		// Handle extension fields with spaces: CEF requires spaces in values to be escaped
+		// Parse key=value pairs and escape spaces in all values
+		var result []string
+		tokens := strings.Split(extension, " ")
+
+		i := 0
+		for i < len(tokens) {
+			token := tokens[i]
+
+			// Check if this token contains '=' (it's a key=value pair)
+			if strings.Contains(token, "=") {
+				kvParts := strings.SplitN(token, "=", 2)
+				if len(kvParts) == 2 {
+					key := kvParts[0]
+					value := kvParts[1]
+
+					// Collect all tokens until we hit the next key=value pair
+					j := i + 1
+					for j < len(tokens) && !strings.Contains(tokens[j], "=") {
+						value += " " + tokens[j]
+						j++
+					}
+
+					// Replace spaces with underscores in the value (CEF spec compliance)
+					valueNormalized := strings.ReplaceAll(value, " ", "_")
+					result = append(result, key+"="+valueNormalized)
+					i = j
+					continue
+				}
+			}
+
+			i++
+		}
+
+		if len(result) > 0 {
+			extension = strings.Join(result, " ")
+		}
+
+		parts[7] = extension
 	}
 
 	// 8️⃣ Reconstruct with CEF: prefix
 	result := "CEF:" + strings.Join(parts, "|")
-
-	fmt.Println("Preprocessed CEF: ", result)
 
 	return result
 }
